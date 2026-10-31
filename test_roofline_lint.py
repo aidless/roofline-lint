@@ -25,19 +25,20 @@ def hw(name):
 
 
 class TestParams(unittest.TestCase):
-    """参数量公式必须能复现官方公布的参数（含 norm、tie/untie 差异）。"""
+    """参数量公式必须能复现官方公布的参数（含 norm、tie/untie 差异）。
+    期望值全部来自 HF API 的 safetensors.total（2026-10-31 实测核对；
+    qwen3-4b 的 4,022,468,096 含 qk_norm 2×128×36=9216，旧口径 4,022,458,880 是漏了它）。"""
 
     def test_known_param_counts(self):
         expect = {
-            "qwen3-4b": 4.022458880e9,
-            "llama-3-8b": 8.030261248e9,
-            "llama-3-70b": 70.633706496e9,
-            "mistral-7b": 7.241732096e9,
+            "qwen3-4b": 4_022_468_096,
+            "llama-3-8b": 8_030_261_248,
+            "llama-3-70b": 70_553_706_496,
+            "mistral-7b": 7_241_732_096,
         }
         for name, want in expect.items():
             got = R.params_of(model(name))
-            self.assertLess(abs(got - want) / want, 0.01,
-                            f"{name}: got {got:,} want {want:,.0f}")
+            self.assertEqual(got, want, f"{name}: got {got:,} want {want:,}")
 
 
 class TestRoofline(unittest.TestCase):
@@ -110,6 +111,120 @@ class TestHonesty(unittest.TestCase):
         self.assertTrue(r["runnable"])
         self.assertIsNotNone(r["step_s"])
         self.assertIn("纸面单步下限", self._report(r))
+
+
+class TestMoE(unittest.TestCase):
+    """MoE：官方参数量来自 HF safetensors 元数据（2026-10-31 实测抓取：
+    Mixtral-8x7B total_size 93,405,584,608 B / bf16 → 46,702,792,704 参数；
+    Qwen3-30B-A3B API safetensors.total = 30,532,122,624）。"""
+
+    def test_moe_params_match_official(self):
+        self.assertAlmostEqual(
+            R.params_of(model("mixtral-8x7b")) / 46_702_792_704, 1.0, delta=0.002)
+        self.assertAlmostEqual(
+            R.active_params_of(model("mixtral-8x7b")) / 12_879_925_248, 1.0, delta=0.002)
+        self.assertAlmostEqual(
+            R.params_of(model("qwen3-30b-a3b")) / 30_532_122_624, 1.0, delta=0.002)
+        self.assertAlmostEqual(
+            R.active_params_of(model("qwen3-30b-a3b")) / 3_353_032_704, 1.0, delta=0.002)
+
+    def test_dense_params_unchanged_by_moe_support(self):
+        # 守卫：支持 MoE 不能动稠密模型的参数（官方含 qk_norm 的总数，见 TestParams 注）
+        self.assertEqual(R.params_of(model("qwen3-4b")), 4_022_468_096)
+        self.assertEqual(R.active_params_of(model("qwen3-4b")), 4_022_468_096)
+
+    def test_moe_b1_reads_only_topk_experts(self):
+        m = model("mixtral-8x7b")
+        r = R.analyze(m, hw("a100-80g"), 2.0, 2.0, 4096, 1)
+        shared = R.params_of(m) - R.expert_params_of(m)
+        expert_b = 3 * m["hidden"] * m["moe"]["inter"] * 2.0
+        want = (shared * 2.0 + 2 * expert_b        # 共享参数 + top-2 专家
+                + 4096 * R.kv_bytes_per_token(m, 2.0))
+        self.assertAlmostEqual(r["read_bytes"], want, delta=want * 1e-9)
+        # 稀疏可见：读取明显小于全部权重
+        self.assertLess(r["read_bytes"], 0.2 * R.params_of(m) * 2.0)
+
+    def test_moe_batch_covers_all_experts(self):
+        m = model("mixtral-8x7b")
+        r = R.analyze(m, hw("a100-80g"), 2.0, 2.0, 1024, 16)   # 16×top2=32 ≥ 8 个专家
+        shared = R.params_of(m) - R.expert_params_of(m)
+        expert_b = 3 * m["hidden"] * m["moe"]["inter"] * 2.0
+        want = (shared * 2.0 + 8 * expert_b                     # 全部 8 个专家都被读到
+                + 16 * 1024 * R.kv_bytes_per_token(m, 2.0))
+        self.assertAlmostEqual(r["read_bytes"], want, delta=want * 1e-9)
+
+    def test_moe_flops_use_active_params(self):
+        m = model("mixtral-8x7b")
+        r = R.analyze(m, hw("a100-80g"), 2.0, 2.0, 4096, 1)
+        attn = 4 * m["layers"] * m["q"] * m["hd"] * 4096
+        want = 2 * R.active_params_of(m) + attn
+        self.assertAlmostEqual(r["flops"], want, delta=want * 1e-9)
+
+    def test_moe_capacity_requires_all_experts(self):
+        # Mixtral fp16 权重 86.99 GiB：单卡 A100-80 装不下——哪怕每 token 只激活 12.9B。
+        # 激活省的是算力和带宽，省不了显存：全部专家都必须常驻。
+        r = R.analyze(model("mixtral-8x7b"), hw("a100-80g"), 2.0, 2.0, 4096, 1)
+        self.assertFalse(r["weights_fit"])
+        self.assertFalse(r["runnable"])
+        self.assertIsNone(r["step_s"])
+        out = R.format_report(r)
+        self.assertIn("装不下", out)
+        self.assertNotIn("纸面单步下限", out)
+
+    def test_moe_report_shows_active_and_experts(self):
+        r = R.analyze(model("qwen3-30b-a3b"), hw("a100-80g"), 2.0, 2.0, 4096, 1)
+        out = R.format_report(r)
+        self.assertIn("激活", out)
+        self.assertIn("专家", out)
+
+
+class TestTensorParallel(unittest.TestCase):
+    def test_tp_splits_weights_kv_flops_and_keeps_ai(self):
+        m = model("qwen3-4b")
+        r1 = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 8, tp=1)
+        r2 = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 8, tp=2)
+        # 权重、KV、FLOPs 都被切成两半 → AI 不变（切分不改变算术强度，只改变时间）
+        self.assertAlmostEqual(r2["ai"], r1["ai"], delta=1e-9)
+        self.assertAlmostEqual(r2["per_gpu_weights_bytes"], r1["weights_bytes"] / 2, delta=1)
+        self.assertAlmostEqual(r2["flops_per_gpu"], r1["flops"] / 2, delta=1)
+        self.assertAlmostEqual(r2["step_s"], r1["step_s"] / 2, delta=1e-6)
+
+    def test_tp_comm_bytes_reported(self):
+        m = model("qwen3-4b")
+        r1 = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 1, tp=1)
+        r2 = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 1, tp=2)
+        r4 = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 1, tp=4)
+        # 每层 2 次 ring AllReduce，每次移动 2(tp-1)/tp × h×batch × 2B
+        self.assertEqual(r1["comm_bytes_per_step"], 0)
+        self.assertEqual(r2["comm_bytes_per_step"], 368_640)
+        self.assertGreater(r4["comm_bytes_per_step"], r2["comm_bytes_per_step"])
+
+    def test_tp_makes_model_fit(self):
+        # Mixtral fp16 86.99 GiB：tp=1 装不下 → tp=2 每卡 43.5 GiB 装得下，给速度
+        m = model("mixtral-8x7b")
+        r1 = R.analyze(m, hw("a100-80g"), 2.0, 2.0, 4096, 1, tp=1)
+        r2 = R.analyze(m, hw("a100-80g"), 2.0, 2.0, 4096, 1, tp=2)
+        self.assertFalse(r1["runnable"])
+        self.assertTrue(r2["runnable"])
+        out = R.format_report(r2)
+        self.assertIn("tp=2", out)
+        self.assertIn("纸面单步下限", out)
+
+    def test_cli_accepts_tp(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = R.main(["--model", "mixtral-8x7b", "--gpu", "a100-80g",
+                         "--tp", "2", "--json"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["tp"], 2)
+        self.assertTrue(payload["runnable"])
+
+    def test_cli_tp_must_be_positive(self):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                R.main(["--tp", "0"])
+        self.assertEqual(cm.exception.code, 2)
 
 
 class TestDataProvenance(unittest.TestCase):

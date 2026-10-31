@@ -37,14 +37,25 @@ Everything is a closed-form estimate of the **decode** phase (generating one tok
 `S` = context length, `b_w` = weight bytes/param, `b_kv` = KV bytes/dim.
 
 ```
-FLOPs / token     ≈ 2·N  +  4·L·q·d·S            # weight matmuls + attention (QKᵀ, AV)
+FLOPs / token     ≈ 2·N_act  +  4·L·q·d·S        # weight matmuls + attention (QKᵀ, AV)
 KV bytes / token  = 2·L·h_kv·d·b_kv              # one K and one V per layer, per KV head
-read bytes / step = N·b_w  +  batch·S·(KV/token) # weights read ONCE per step + all KV
+read bytes / step = weights-read + batch·S·(KV/token)  # weights read ONCE per step
 arithmetic inten. = FLOPs / read_bytes
 ridge point       = peak FLOPS / peak bandwidth
 AI < ridge  → memory-bound ;  AI ≥ ridge → compute-bound
 step time (floor) = read_bytes / bandwidth   (memory)  |  FLOPs / peak_flops  (compute)
 ```
+
+- **Dense**: `N_act = N`, `weights-read = N·b_w`.
+- **MoE** (`--model mixtral-8x7b`, `--model qwen3-30b-a3b`): `N_act = shared + top_k·expert`,
+  and `weights-read = shared + min(batch·top_k, E)·expert` — a small batch touches only the
+  activated experts; a batch ≥ E/top_k sweeps them all. **Capacity still uses the full N**:
+  activation saves FLOPs and bandwidth, it does not save VRAM.
+- **Tensor parallel** (`--tp N`): weights, KV, and FLOPs are split N ways per GPU, so the
+  arithmetic intensity is **unchanged** and the per-GPU step time drops ≈ N×. The report also
+  prints the ideal-ring AllReduce lower bound `8·(N_tp−1)/N_tp · L · hidden · batch`
+  bytes/step/GPU — explicitly *not* folded into the step-time floor, since that needs a
+  measured bus bandwidth.
 
 The "weights read **once** per step" is the whole reason batching works: matmul FLOPs scale
 with the batch, but the weight read does not, so AI rises with batch until the KV read takes
@@ -99,7 +110,7 @@ $ python3 roofline_lint.py --gpu rtx-3060m-6g --seq 4096 --batch 1
 ...
 权重: 7.49 GiB / 6 GiB  ✗ 装不下
 判定: 跑不起来——权重本身就装不进显存。超 1.49 GiB。这个配置根本部署不了，任何时间/吞吐数字都会是假的，所以这里不印。
-出路: 换更大显存的卡 / 降低权重量化（--precision int4）/ 多卡切分（本工具不建模 TP）。
+出路: 换更大显存的卡 / 降低权重量化（--precision int4）/ 张量并行（--tp N，权重按卡数均分）。
 ```
 
 ### The weights fit but the batch's KV doesn't
@@ -121,6 +132,26 @@ python3 roofline_lint.py --gpu rtx-3060m-6g --precision int4 --kv-precision fp16
 python3 roofline_lint.py --gpu rtx-3060m-6g --precision int4 --kv-precision int4 --batch 29
 ```
 
+### MoE and tensor parallel
+
+```bash
+# Mixtral 8x7B fp16 = 86.99 GiB of weights: single A100-80G cannot hold it — refused, no numbers
+$ python3 roofline_lint.py --model mixtral-8x7b --gpu a100-80g
+MoE: 8 专家取 top-2；本步读取 min(batch×2, 8) = 2 个专家的权重，但全部 8 个专家都必须常驻显存
+权重: 86.99 GiB / 80 GiB 每卡  ✗ 装不下
+判定: 跑不起来——权重本身就装不进显存。每卡超 6.99 GiB。…所以这里不印。
+
+# tp=2: weights/KV/FLOPs split per GPU → it fits, and you get the per-GPU floor + ring-AllReduce lower bound
+$ python3 roofline_lint.py --model mixtral-8x7b --gpu a100-80g --tp 2
+→ MEMORY-BOUND … roofline 理论算力上界 / 峰值 ≈ 4.10%
+纸面单步下限 ≈ 1.1 ms（每 token 1.09 ms，聚合 ≈ 916 tok/s）
+
+# A3B MoE: 30.5B total but only 3.35B active — cheap FLOPs, full 56.87 GiB still resident
+$ python3 roofline_lint.py --model qwen3-30b-a3b --gpu a100-80g
+模型: qwen3-30b-a3b (30.53B 参数 …；MoE 激活 3.35B)
+权重: 56.87 GiB / 80 GiB 每卡  ✓
+```
+
 ---
 
 ## CLI reference
@@ -134,6 +165,7 @@ python3 roofline_lint.py --gpu rtx-3060m-6g --precision int4 --kv-precision int4
 | `--kv-precision P` | follows `--precision` | KV-cache precision (independent of weights) |
 | `--seq N` | `4096` | context length (prompt + generated tokens) |
 | `--batch N` | `1` | concurrent requests |
+| `--tp N` | `1` | tensor parallel: split weights/KV/FLOPs across N GPUs (per-GPU view + ideal-ring comm bound) |
 | `--json` | off | machine-readable output |
 | `--list` | — | list model & hardware presets, with sources |
 | `--selftest` | — | run the built-in assertions |
@@ -150,14 +182,17 @@ figures — not measured here, and not `--sparsity` marketing numbers. Please ch
 don't treat them as guarantees.
 
 **Models** (dims copied from each repo's `config.json`; params derived by `params_of` and
-cross-checked against the published counts in the tests):
+verified **byte-exact** against HF safetensors `total_size` / API `safetensors.total` in the
+tests, 2026-10-31):
 
-| preset | params | layers | heads | config.json |
+| preset | params (total / active) | layers | heads | config.json |
 |---|---|---|---|---|
-| qwen3-4b | 4.02 B | 36 | 32Q / 8KV | `Qwen/Qwen3-4B` |
-| llama-3-8b | 8.03 B | 32 | 32Q / 8KV | `NousResearch/Meta-Llama-3-8B` |
-| llama-3-70b | 70.6 B | 80 | 64Q / 8KV | `NousResearch/Meta-Llama-3-70B` |
-| mistral-7b | 7.24 B | 32 | 32Q / 8KV | `mistralai/Mistral-7B-v0.1` ⚠️ sliding-window 4096 |
+| qwen3-4b | 4.02 B (dense) | 36 | 32Q / 8KV | `Qwen/Qwen3-4B` |
+| llama-3-8b | 8.03 B (dense) | 32 | 32Q / 8KV | `NousResearch/Meta-Llama-3-8B` |
+| llama-3-70b | 70.55 B (dense) | 80 | 64Q / 8KV | `NousResearch/Meta-Llama-3-70B` |
+| mistral-7b | 7.24 B (dense) | 32 | 32Q / 8KV | `mistralai/Mistral-7B-v0.1` ⚠️ sliding-window 4096 |
+| mixtral-8x7b | 46.70 B / 12.88 B active, top-2 of 8 | 32 | 32Q / 8KV | `mistralai/Mixtral-8x7B-v0.1` |
+| qwen3-30b-a3b | 30.53 B / 3.35 B active, top-8 of 128 | 48 | 32Q / 4KV | `Qwen/Qwen3-30B-A3B` |
 
 **Hardware** (peak FLOPs / bandwidth / VRAM):
 
@@ -180,8 +215,8 @@ To add a GPU, copy a `HW_PRESETS` entry and cite your source.
 ## Tests
 
 ```bash
-python3 -m unittest test_roofline_lint -v   # 18 tests
-python3 roofline_lint.py --selftest         # 9 pinned arithmetic points
+python3 -m unittest test_roofline_lint -v   # 30 tests
+python3 roofline_lint.py --selftest         # 13 pinned arithmetic points
 python3 roofline_lint.py --prove-red        # injects a bug, asserts the suite catches it
 ```
 
@@ -197,11 +232,17 @@ mechanism, not a tautology.
 - **Analytical lower bound, not a benchmark.** Peak specs × op counts. Real kernels reach a
   fraction of peak; scheduling, launch overhead, and memory-system contention are not modelled.
 - **Decode focus.** Prefill is reported only as a regime indicator (weight-dominated approx).
-- **No tensor parallelism.** Multi-GPU weight sharding and collective-communication cost are out
-  of scope; the tool will tell you a model doesn't fit rather than pretend TP fixes it for free.
-- **Dense attention.** Standard GQA MHA math. MoE routing, MLA, sliding-window effective KV, and
+- **Tensor parallelism is an idealized split.** `--tp N` divides weights/KV/FLOPs by N; the
+  AllReduce bound printed is the textbook ideal ring and is *not* folded into the step-time
+  floor — real bus bandwidth, overlap, and pipeline/expert parallelism are out of scope.
+- **MoE reads are approximated.** The weight-read model uses `min(batch·top_k, E)` experts per
+  step with balanced routing; real routers are not balanced, and expert weights cannot be split
+  arbitrarily across TP ranks in practice.
+- **Dense attention.** Standard GQA MHA math. MLA, sliding-window effective KV, and
   PagedAttention's block-level effects are not modelled (mistral-7b's window is flagged, but the
   KV number is a full-context upper bound).
+- **TP needs divisibility.** Heads and KV heads must divide evenly across ranks; the report
+  flags a warning when the KV head count is not divisible by `--tp`.
 - **VRAM = weights + KV only.** Activations, CUDA context, fragmentation, and the prefill
   transient spike are not in the fit check — real serving needs headroom above this floor.
 
@@ -216,7 +257,7 @@ If any of those matter for your decision, measure. This tool exists to tell you 
 |---|---|---|---|---|---|
 | **roofline-lint** (this) | fit + bottleneck lint | **yes** | **yes** | **yes (`--prove-red`)** | **0** |
 | Pluenet-Killian/llm-roofline | decode tok/s floor, GPU ranking | no (it's a floor) | no | node:test | 0 |
-| azrabano23/llm-roofline → maverickanos simulator | full latency/throughput/energy/cost sim, TP | no | partial | yes | numpy/matplotlib |
+| azrabano23/llm-roofline → maverickanos simulator | full latency/throughput/energy/cost sim | no | partial | yes | numpy/matplotlib |
 | monamishra95/roofline-model-llm-inference | teaching + interactive calc | no | no | — | JS |
 | KV-cache calculators (many) | KV/VRAM sizing | sizing only | yes (KV) | varies | JS/browser |
 
