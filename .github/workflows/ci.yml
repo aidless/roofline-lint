@@ -11,7 +11,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        # 3.9 dropped on 2026-11-01: actions/setup-python can no longer install it on the
+        # ubuntu-latest image, so that matrix entry failed at *step 1* while the suite itself
+        # passed on 3.10/3.11/3.12. The badge must reflect what is actually verified.
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -23,4 +26,6 @@ jobs:
       - name: Self-test (pinned arithmetic)
         run: python roofline_lint.py --selftest
       - name: Prove the tests can fail
+        # Exits 1 when an injected bug fails to turn the suite red — this job goes red when the
+        # safety net has become decorative, not merely when the code is wrong.
         run: python roofline_lint.py --prove-red

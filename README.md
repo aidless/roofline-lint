@@ -3,7 +3,7 @@
 **A zero-dependency CLI that tells you whether an LLM deployment actually fits — and refuses to print a throughput number when it doesn't.**
 
 [![CI](https://github.com/aidless/roofline-lint/actions/workflows/ci.yml/badge.svg)](https://github.com/aidless/roofline-lint/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![deps](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](#)
 
@@ -11,24 +11,41 @@
 
 ## Why another roofline tool
 
-There are already good roofline and KV-cache calculators (see [comparison](#vs-existing-tools)). Almost all of them answer **"how fast could it go?"** and quietly assume the model fits. When it doesn't fit — weights larger than VRAM, or the requested batch's KV cache larger than the free memory — they still hand you a tokens/s number. That number is physically impossible, yet it gets copied straight into a capacity-planning spreadsheet.
+Good roofline and KV-cache calculators already exist (see [comparison](#vs-existing-tools)), and the
+strong ones are not naive about feasibility: `LLM-Viewer` reports peak memory next to inference
+time, and `pochenai/llm-inference-calculator` reports OOM and back-solves the maximum batch size
+when a config does not fit. Feasibility checking is *not* a gap in this ecosystem, and this tool
+does not claim to have invented it.
 
-`roofline-lint` is built around one rule:
+The gap I could not find filled is narrower, and it is about trusting the tool rather than adding
+features: **what happens when the analysis itself is wrong?**
 
-> **If the config cannot run, the only honest answer is "it can't run" — not a fantasy number.**
+So `roofline-lint` is built around two rules.
 
-So it answers three questions, in this order:
+> **1. If the config cannot run, the only honest answer is "it can't run" — not a fantasy number.**
+
+That is a design choice, not a novelty claim: back-solving a maximum batch (what `pochenai` does)
+and refusing outright (what this tool does) are both defensible; silently printing tokens/s for an
+impossible config is not.
+
+> **2. A test that cannot fail proves nothing — so the tool must be able to show its own tests failing.**
+
+`--prove-red` injects two known-wrong formulas (weights read once per request; the compute-bound
+pipeline formula applied to a memory-bound decode) and asserts the suite turns red. That is the
+one thing I could not find in any of the roofline tools surveyed on 2026-11-01.
+
+It answers three questions, in this order:
 
 1. **Does it fit?** weights ≤ VRAM, and `batch × KV_per_request` ≤ free VRAM.
 2. **If it fits, where is the bottleneck?** memory-bandwidth vs compute, via roofline arithmetic intensity.
 3. **If it's bandwidth-bound, does raising the batch help?** (yes at batch=1 — weights dominate the read; the returns taper as KV starts to dominate).
 
-And four things most one-shot calculators skip:
+Plus four things worth checking for in any calculator:
 
 - **Weight precision and KV precision are independent** (`--precision int4 --kv-precision fp16`). "Quantize the weights to fit" and "quantize the KV cache to fit more sequences" are different levers with different costs — the tool keeps them apart, and shows that int4 weights + fp16 KV can *cut your max concurrent requests by 4×*.
-- **Tensor parallel *and* pipeline parallel, and they are not interchangeable** (`--tp`, `--pp`). TP splits weights/KV/FLOPs and raises throughput; PP splits layers and buys capacity. On the same two A100s, llama-3-70B does **215 tok/s with `--tp 2`** and **25 tok/s with `--pp 2 --micro-batch 8`** — because every micro-batch re-reads the stage's weights. The report says "slower than one card" out loud instead of printing a happy number.
+- **Tensor parallel *and* pipeline parallel, and they are not interchangeable** (`--tp`, `--pp`). TP splits weights/KV/FLOPs and raises throughput; PP splits layers and buys capacity. On the same two A100s, llama-3-70B does **215 tok/s with `--tp 2`** and **25 tok/s with `--pp 2 --micro-batch 8`** — because every micro-batch re-reads the stage's weights. `pochenai`'s model explicitly assumes `bubble ≈ 0` and so cannot produce this; the report says "slower than one card" out loud instead of printing a happy number.
 - **Paged KV shows its own fragmentation** (`--kv-block`). A 100-token request with 16-token blocks really occupies 112 tokens — 12% wasted, and it's exactly the short-request traffic where paging is supposed to pay off.
-- **The self-test can go red.** `--prove-red` injects two classic bugs (weights read once per request; the compute-bound PP formula applied to a memory-bound decode) and asserts the suite catches both. A test that cannot fail proves nothing.
+- **The self-test can go red** (rule 2 above). Pin 17 hand-computed working points, then prove the pins are wired to a real mechanism rather than to themselves.
 
 ---
 
@@ -338,19 +355,30 @@ If any of those matter for your decision, measure. This tool exists to tell you 
 
 ## Vs existing tools
 
-| Tool | Focus | Refuses infeasible configs? | Decouples weight/KV precision? | Provable tests? | Deps |
+| Tool | Focus | Infeasible configs | Weight/KV precision separated | Can prove its own tests fail? | Deps |
 |---|---|---|---|---|---|
-| **roofline-lint** (this) | fit + bottleneck lint | **yes** | **yes** | **yes (`--prove-red`)** | **0** |
-| Pluenet-Killian/llm-roofline | decode tok/s floor, GPU ranking | no (it's a floor) | no | node:test | 0 |
-| azrabano23/llm-roofline → maverickanos simulator | full latency/throughput/energy/cost sim | no | partial | yes | numpy/matplotlib |
-| monamishra95/roofline-model-llm-inference | teaching + interactive calc | no | no | — | JS |
+| **roofline-lint** (this) | fit + bottleneck lint | **refuses outright, prints no number** | **yes** | **yes — `--prove-red`** | **0** |
+| `hahnyuan/LLM-Viewer` (689★) | layer-wise analysis, peak memory + time | reports peak memory, no dedicated gate | no | no test suite | many |
+| `feifeibear/LLMRoofline` (126★) | hardware-comparison grid | n/a | no | no test suite | deps |
+| `pochenai/llm-inference-calculator` (22★) | full static perf model: 403 models, 110 GPUs, TP/PP/EP/DP, web UI | **yes — reports OOM and back-solves `B_max`** | **yes** | guard tests (contradictory *inputs* throw), but no formula-injection proof | npm |
+| `Pluenet-Killian/llm-roofline` | decode tok/s floor + GPU ranking | no (it is a floor) | no | node:test | 0 |
+| `maverickanos` simulator | latency/throughput/energy/cost sim | no | partial | yes | numpy/matplotlib |
+| `monamishra95` | teaching + interactive calc | no | no | — | JS |
 | KV-cache calculators (many) | KV/VRAM sizing | sizing only | yes (KV) | varies | JS/browser |
 
+**How this table was built (2026-11-01):** each row comes from reading that project's README *and*
+its repo tree. The "no test suite" cells are literal — `git/trees?recursive=1` returns zero
+test/spec files for `LLM-Viewer` and `LLMRoofline` on that date. Star counts are as of that date.
+
+If a row is wrong, please open an issue. I would rather correct a flattering table than keep one:
+an earlier version of this table omitted `LLM-Viewer` and `pochenai` entirely and claimed other
+tools "still hand you a tokens/s number" for impossible configs, which was simply false.
+
 The niche is narrow and deliberate: **a tiny, honest feasibility gate you can drop in front of
-a real benchmark run.** It covers dense and MoE models, tensor and pipeline parallelism, and
-paged KV — but only at the level of *accounting*, never scheduling. If you want a rich simulator,
-use one of the others; if you want a fast "will this even launch, and where will it hurt", use
-this.
+a real benchmark run, with a switch that proves the gate can fail.** It covers dense and MoE
+models, tensor and pipeline parallelism, and paged KV — but only at the level of *accounting*,
+never scheduling. If you want a rich simulator with 403 models, use `pochenai`'s; if you want a
+fast "will this even launch, and where will it hurt, and can I trust the answer", use this.
 
 ---
 
