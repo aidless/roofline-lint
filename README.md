@@ -23,10 +23,12 @@ So it answers three questions, in this order:
 2. **If it fits, where is the bottleneck?** memory-bandwidth vs compute, via roofline arithmetic intensity.
 3. **If it's bandwidth-bound, does raising the batch help?** (yes at batch=1 — weights dominate the read; the returns taper as KV starts to dominate).
 
-And two extras that most one-shot calculators skip:
+And four things most one-shot calculators skip:
 
 - **Weight precision and KV precision are independent** (`--precision int4 --kv-precision fp16`). "Quantize the weights to fit" and "quantize the KV cache to fit more sequences" are different levers with different costs — the tool keeps them apart, and shows that int4 weights + fp16 KV can *cut your max concurrent requests by 4×*.
-- **The self-test can go red.** `--prove-red` injects a classic bug (reading weights once per request instead of once per step) and asserts the test catches it. A test that cannot fail proves nothing.
+- **Tensor parallel *and* pipeline parallel, and they are not interchangeable** (`--tp`, `--pp`). TP splits weights/KV/FLOPs and raises throughput; PP splits layers and buys capacity. On the same two A100s, llama-3-70B does **215 tok/s with `--tp 2`** and **25 tok/s with `--pp 2 --micro-batch 8`** — because every micro-batch re-reads the stage's weights. The report says "slower than one card" out loud instead of printing a happy number.
+- **Paged KV shows its own fragmentation** (`--kv-block`). A 100-token request with 16-token blocks really occupies 112 tokens — 12% wasted, and it's exactly the short-request traffic where paging is supposed to pay off.
+- **The self-test can go red.** `--prove-red` injects two classic bugs (weights read once per request; the compute-bound PP formula applied to a memory-bound decode) and asserts the suite catches both. A test that cannot fail proves nothing.
 
 ---
 
@@ -152,6 +154,72 @@ $ python3 roofline_lint.py --model qwen3-30b-a3b --gpu a100-80g
 权重: 56.87 GiB / 80 GiB 每卡  ✓
 ```
 
+### Paged KV: block-level allocation is not free for short requests
+
+PagedAttention allocates KV in fixed-size blocks, so a request shorter than a block still pays
+for the whole block. `--kv-block` makes that padding visible:
+
+```bash
+# 100-token request with 16-token blocks: you pay for 112 tokens, 12.0% wasted
+$ python3 roofline_lint.py --gpu a100-40g --seq 100 --batch 1 --kv-block 16
+配置: … prompt 100 | batch 1 | KV 块 16 token（分页分配）
+分页: KV 按 16 token 整块分配 → 每请求占 112 token（内部碎片 12 token，12.0%）
+
+# 4096 tokens with the same 16-token blocks: zero padding — block granularity is free
+$ python3 roofline_lint.py --gpu a100-40g --seq 4096 --batch 1 --kv-block 16
+分页: KV 按 16 token 整块分配 → 每请求占 4096 token（内部碎片 0 token，0.0%）
+```
+
+The waste is a *fraction of one block per request*, so it only matters when requests are short.
+That is precisely the traffic shape where paging is supposed to help (many small chats), which
+is worth knowing before you attribute a capacity win to the scheduler alone.
+
+### Pipeline parallelism buys capacity, not speed
+
+This is the section worth reading twice. `--pp N` splits the model into N layer stages. Same
+GPU count, same model: compare pipeline parallel against tensor parallel on 2×A100-80G.
+
+```bash
+# tp=2: shard weights/KV/FLOPs across 2 GPUs
+$ python3 roofline_lint.py --model llama-3-70b --gpu a100-80g --batch 8 --tp 2
+纸面单步下限 ≈ 37.2 ms（每 token 4.65 ms，聚合 ≈ 215 tok/s）
+
+# pp=2 with 8 micro-batches: exactly the same 2 GPUs
+$ python3 roofline_lint.py --model llama-3-70b --gpu a100-80g --batch 8 --pp 2 --micro-batch 8
+PP: 模型按 pp=2 切成 2 段（每段约 40.0 层），8 个微批 → 气泡占比 11.1%；相对同卡只做 TP 的有效吞吐 0.24×
+⚠️  微批开到 8 个，每个微批都要把本段权重**再读一遍** → 这套 PP 配置比单卡还慢（0.24×）。
+纸面流水线排空 ≈ 314.4 ms（每段 34.93 ms × 9 步；每 token 39.30 ms，聚合 ≈ 25 tok/s）
+```
+
+**215 tok/s vs 25 tok/s on the same hardware — PP is 8.6× slower here.** The reason is not the
+bubble (only 11.1%). It is that decode is memory-bound, and every micro-batch re-reads the whole
+stage's weights from HBM. Eight micro-batches means eight weight reads per step. Tensor parallel
+does the opposite: it divides both the weights *and* the KV bytes, so its memory traffic per GPU
+falls.
+
+Shrink the micro-batch count and the penalty shrinks with it — but it never turns into a speedup:
+
+```bash
+# M=1: exactly throughput-neutral (1.00×). Each GPU reads its own half of the weights once,
+# so the total weight traffic per step equals the single-card case. Bubble 50.0%.
+$ python3 roofline_lint.py --model llama-3-70b --gpu a100-80g --batch 32 --pp 2 --micro-batch 1
+PP: 模型按 pp=2 切成 2 段（每段约 40.0 层），1 个微批 → 气泡占比 50.0%；相对同卡只做 TP 的有效吞吐 1.00×
+
+# M=2: still below 1.0 for a 70B model — weights dominate the read, so re-reading them hurts
+$ python3 roofline_lint.py --model llama-3-70b --gpu a100-80g --batch 32 --pp 2 --micro-batch 2
+PP: … 2 个微批 → 气泡占比 33.3%；相对同卡只做 TP 的有效吞吐 0.75×
+
+# The one case where PP is a net win: when KV reads dominate weights (small model, long
+# context, big batch). qwen3-4b at B=32: KV is 19.3 GB/step vs 8.0 GB of weights.
+$ python3 roofline_lint.py --model qwen3-4b --gpu a100-80g --batch 32 --pp 2 --micro-batch 2
+PP: … 气泡占比 33.3%；相对同卡只做 TP 的有效吞吐 1.03×
+```
+
+So the rule the tool encodes: **PP for capacity, TP for throughput.** PP with M=1 costs you
+nothing in throughput and halves the per-GPU weight footprint — that is the honest pitch. Any
+M > 1 re-reads weights and loses throughput on a memory-bound decode, and the report says so
+explicitly instead of printing a happy number.
+
 ---
 
 ## CLI reference
@@ -166,10 +234,13 @@ $ python3 roofline_lint.py --model qwen3-30b-a3b --gpu a100-80g
 | `--seq N` | `4096` | context length (prompt + generated tokens) |
 | `--batch N` | `1` | concurrent requests |
 | `--tp N` | `1` | tensor parallel: split weights/KV/FLOPs across N GPUs (per-GPU view + ideal-ring comm bound) |
+| `--pp N` | `1` | pipeline parallel: split the model into N layer stages (capacity, not throughput) |
+| `--micro-batch M` | `= --batch` when `--pp>1` | micro-batches per step; only valid with `--pp>1`, and `M ≤ --batch`. More micro-batches = smaller bubble, but the stage's weights get re-read M times |
+| `--kv-block N` | off | page the KV cache in N-token blocks (PagedAttention); shows internal fragmentation |
 | `--json` | off | machine-readable output |
 | `--list` | — | list model & hardware presets, with sources |
 | `--selftest` | — | run the built-in assertions |
-| `--prove-red` | — | inject the batching bug; prove the assertions go red |
+| `--prove-red` | — | inject two known wrong formulas; prove the assertions go red |
 
 Exit codes: `0` ok, `1` self-test/prove-red failed, `2` bad arguments.
 
@@ -215,15 +286,21 @@ To add a GPU, copy a `HW_PRESETS` entry and cite your source.
 ## Tests
 
 ```bash
-python3 -m unittest test_roofline_lint -v   # 30 tests
-python3 roofline_lint.py --selftest         # 13 pinned arithmetic points
-python3 roofline_lint.py --prove-red        # injects a bug, asserts the suite catches it
+python3 -m unittest test_roofline_lint -v   # 43 tests
+python3 roofline_lint.py --selftest         # 17 pinned arithmetic points
+python3 roofline_lint.py --prove-red        # injects two bugs, asserts the suite catches both
 ```
 
-`--prove-red` prints the number the bug *would* produce (AI stays 1.21 instead of rising to
-12.2), then flags the assertion red. If a future change ever made the batching math wrong, the
-ordinary `--selftest` would fail too — the red proof shows the assertions are wired to a real
-mechanism, not a tautology.
+`--prove-red` injects two wrong formulas and prints the numbers they *would* produce:
+
+1. **Batching bug** — treating "read the weights once per step" as "each of the batch requests
+   reads the weights". AI stays 1.21 instead of rising to 12.2.
+2. **Textbook-PP bug** — using the compute-bound pipeline formula `P·M/(M+P−1)` instead of the
+   byte-aware one. For `pp=2 M=32` it claims **1.94×** when the real answer is **0.19×** (a 10.1×
+   gap, and the wrong sign: it says "faster than one card" when the truth is "5× slower").
+
+If a future change ever made either formula wrong, `--selftest` would fail too — the red proof
+shows the assertions are wired to a real mechanism, not a tautology.
 
 ---
 
@@ -234,13 +311,21 @@ mechanism, not a tautology.
 - **Decode focus.** Prefill is reported only as a regime indicator (weight-dominated approx).
 - **Tensor parallelism is an idealized split.** `--tp N` divides weights/KV/FLOPs by N; the
   AllReduce bound printed is the textbook ideal ring and is *not* folded into the step-time
-  floor — real bus bandwidth, overlap, and pipeline/expert parallelism are out of scope.
+  floor — real bus bandwidth and overlap are out of scope.
+- **Pipeline parallelism is a byte-accounting model, not a scheduler.** `--pp N` assumes uniform
+  layers, one forward stage per GPU, and a stage reading its share of the weights once per
+  micro-batch. It does not model communication between stages (activation/P2P), interleaved
+  1F1B schedules, or the fact that real frameworks require the layer count to divide evenly
+  (the report warns when it does not). Its speedup ceiling is therefore a *lower* bound on how
+  badly naive PP loses, not an upper bound on what a good schedule achieves.
+- **Paged KV models fragmentation only.** `--kv-block N` rounds each request up to a whole
+  number of blocks and reports the padding. It does not model block tables, copy-on-write
+  sharing, prefix caching, or the allocator's external fragmentation.
 - **MoE reads are approximated.** The weight-read model uses `min(batch·top_k, E)` experts per
   step with balanced routing; real routers are not balanced, and expert weights cannot be split
   arbitrarily across TP ranks in practice.
-- **Dense attention.** Standard GQA MHA math. MLA, sliding-window effective KV, and
-  PagedAttention's block-level effects are not modelled (mistral-7b's window is flagged, but the
-  KV number is a full-context upper bound).
+- **Dense attention.** Standard GQA MHA math. MLA and sliding-window effective KV are not
+  modelled (mistral-7b's window is flagged, but the KV number is a full-context upper bound).
 - **TP needs divisibility.** Heads and KV heads must divide evenly across ranks; the report
   flags a warning when the KV head count is not divisible by `--tp`.
 - **VRAM = weights + KV only.** Activations, CUDA context, fragmentation, and the prefill
@@ -262,8 +347,10 @@ If any of those matter for your decision, measure. This tool exists to tell you 
 | KV-cache calculators (many) | KV/VRAM sizing | sizing only | yes (KV) | varies | JS/browser |
 
 The niche is narrow and deliberate: **a tiny, honest feasibility gate you can drop in front of
-a real benchmark run.** If you want a rich simulator, use one of the others; if you want a fast
-"will this even launch, and where will it hurt", use this.
+a real benchmark run.** It covers dense and MoE models, tensor and pipeline parallelism, and
+paged KV — but only at the level of *accounting*, never scheduling. If you want a rich simulator,
+use one of the others; if you want a fast "will this even launch, and where will it hurt", use
+this.
 
 ---
 

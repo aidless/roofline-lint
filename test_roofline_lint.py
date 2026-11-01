@@ -227,6 +227,132 @@ class TestTensorParallel(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class TestPagedKV(unittest.TestCase):
+    """PagedAttention 的块粒度：KV 按整块分配，每个请求最多浪费一块。
+
+    关键事实：块粒度对长上下文几乎免费（4096 能被 16 整除 → 0 碎片），
+    对**短请求**却很明显（100 token 在 block=16 下要占 112 token = 12% 浪费）。
+    本工具默认不启用（--kv-block 缺省 = 精确分配），启用后按整块算容量。
+    """
+
+    def test_block_padding_rounds_up(self):
+        m = model("qwen3-4b")
+        r = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 100, 1, kv_block=16)
+        self.assertEqual(r["kv_alloc_tokens"], 112)
+        self.assertEqual(r["kv_pad_tokens"], 12)
+        self.assertAlmostEqual(r["kv_pad_pct"], 12.0, delta=1e-6)
+        # 被多分配的那 12 个 token 也要占显存，容量必须按 112 算
+        self.assertEqual(r["kv_per_req"], 112 * 147456)
+
+    def test_no_block_means_exact_allocation(self):
+        m = model("qwen3-4b")
+        r = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 1)
+        self.assertIsNone(r["kv_block"])
+        self.assertEqual(r["kv_alloc_tokens"], 4096)
+        self.assertEqual(r["kv_pad_tokens"], 0)
+        self.assertEqual(r["kv_per_req"], 4096 * 147456)
+
+    def test_long_context_block_padding_is_free(self):
+        # 4096 能被 16 整除 → 零碎片。"块粒度对长上下文几乎免费"的判据就在这一行。
+        m = model("qwen3-4b")
+        r = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 1, kv_block=16)
+        self.assertEqual(r["kv_pad_tokens"], 0)
+
+    def test_padding_can_cost_the_last_request(self):
+        # 造一张显存刚好卡在「100 token 放得下、112 token 放不下」的卡：
+        # free = 15,428,932 B；100 token 需 14,745,600，112 token 需 16,515,072。
+        m = model("qwen3-4b")
+        tight = {"flops": 312e12, "bandwidth": 1555e9, "vram": 7.5068, "name": "tight"}
+        r0 = R.analyze(m, tight, 2.0, 2.0, 100, 1)
+        r1 = R.analyze(m, tight, 2.0, 2.0, 100, 1, kv_block=16)
+        self.assertEqual(r0["max_concurrency"], 1)
+        self.assertEqual(r1["max_concurrency"], 0)
+        self.assertFalse(r1["runnable"])
+        self.assertTrue(r0["runnable"])
+
+    def test_max_concurrency_reported(self):
+        m = model("qwen3-4b")
+        r = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 1)
+        self.assertEqual(r["max_concurrency"], 57)   # 余量 32.51 GiB / 每请求 0.5625 GiB
+
+
+class TestPipelineParallel(unittest.TestCase):
+    """流水线并行：买的是容量，不是速度。
+
+    decode 是 memory-bound，每处理一个微批，本段的权重都要**再读一遍**，
+    所以微批越多、权重被重读越多次。P 段 M 微批的真实加速比是
+
+        P·M·(w+k) / ((M+P−1)·(M·w+k))
+
+    而不是教科书（compute-bound 口径）的 P·M/(M+P−1)。
+    微批开太大时它会小于 1——也就是比单卡还慢。
+    """
+
+    def test_pp_splits_weights_per_gpu(self):
+        m = model("llama-3-70b")
+        r1 = R.analyze(m, hw("a100-80g"), 2.0, 2.0, 4096, 1, pp=1)
+        r2 = R.analyze(m, hw("a100-80g"), 2.0, 2.0, 4096, 1, pp=2)
+        self.assertFalse(r1["runnable"])          # 141.11 GiB > 80 GiB
+        self.assertTrue(r2["runnable"])           # 70.55 GiB < 80 GiB
+        self.assertAlmostEqual(r2["per_gpu_weights_bytes"], r1["weights_bytes"] / 2, delta=1)
+
+    def test_pp_speedup_matches_memory_bound_derivation(self):
+        # qwen3-4b @ a100-40g, B=32: w=8.045e9 B, k=19.332e9 B
+        # P=2 M=2 → 2·2·(w+k)/((2+1)·(2w+k)) = 1.0305
+        m = model("qwen3-4b")
+        r = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 32, pp=2, micro_batch=2)
+        self.assertAlmostEqual(r["pp_speedup"], 1.0305, delta=1e-3)
+        self.assertAlmostEqual(r["bubble_frac"], 1 / 3, delta=1e-9)
+
+    def test_pp_many_microbatches_is_worse_than_one_card(self):
+        # 每个请求一个微批（M=32）→ 权重被重读 32 次，比单卡慢 5 倍。
+        # 手算：w=8,044,936,192  k=19,327,352,832
+        #   2·32·(w+k) / (33·(32w+k)) = 1,751,826,497,536 / 9,133,255,262,208 = 0.1918
+        m = model("qwen3-4b")
+        r = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 32, pp=2, micro_batch=32)
+        self.assertLess(r["pp_speedup"], 1.0)
+        self.assertAlmostEqual(r["pp_speedup"], 0.1918, delta=2e-3)
+
+    def test_pp_one_microbatch_gives_no_gain(self):
+        m = model("qwen3-4b")
+        r = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 8, pp=4, micro_batch=1)
+        self.assertAlmostEqual(r["pp_speedup"], 1.0, delta=1e-9)
+        self.assertAlmostEqual(r["bubble_frac"], 0.75, delta=1e-9)
+
+    def test_pp_and_tp_multiply(self):
+        m = model("qwen3-4b")
+        base = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 32)
+        r = R.analyze(m, hw("a100-40g"), 2.0, 2.0, 4096, 32, tp=2, pp=2, micro_batch=2)
+        self.assertAlmostEqual(r["per_gpu_weights_bytes"], r["weights_bytes"] / 4, delta=1)
+        # 切分不改变"每步权重只读一次"的理想算术强度
+        self.assertAlmostEqual(r["ai"], base["ai"], delta=1e-9)
+
+    def test_pp_layers_indivisible_warns(self):
+        m = model("llama-3-70b")           # 80 层，pp=3 不能整除
+        r = R.analyze(m, hw("a100-80g"), 2.0, 2.0, 4096, 4, pp=3, micro_batch=3)
+        self.assertIn("不能被 pp", R.format_report(r))
+
+    def test_cli_micro_batch_cannot_exceed_batch(self):
+        # 微批不能比总并发还多：那意味着有空微批可用（且会让气泡公式失真）
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                R.main(["--pp", "2", "--micro-batch", "8", "--batch", "4"])
+        self.assertEqual(cm.exception.code, 2)
+        # 断言报错信息本身，而不是只靠 argparse 把未知参数当错误（后者会假过）
+        self.assertIn("micro-batch", err.getvalue())
+
+    def test_cli_accepts_pp_and_micro_batch(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = R.main(["--model", "qwen3-4b", "--gpu", "a100-40g", "--batch", "32",
+                         "--pp", "2", "--micro-batch", "2", "--json"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["pp"], 2)
+        self.assertEqual(payload["micro_batch"], 2)
+
+
 class TestDataProvenance(unittest.TestCase):
     """每个预设都必须带 source，否则等于不可溯源的黑数。"""
 

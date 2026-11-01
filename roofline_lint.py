@@ -214,7 +214,8 @@ def precision_name(b):
 # ---------------------------------------------------------------------------
 # 核心：分析一个部署配置
 # ---------------------------------------------------------------------------
-def analyze(model, hw, weight_b, kv_b, seq, batch, tp=1):
+def analyze(model, hw, weight_b, kv_b, seq, batch, tp=1, pp=1, micro_batch=None,
+            kv_block=None):
     """返回一个 dict，包含可行性、瓶颈判定、以及（仅当跑得起来才有的）时间/吞吐。
 
     model: dict（见 MODEL_PRESETS 结构）
@@ -223,29 +224,56 @@ def analyze(model, hw, weight_b, kv_b, seq, batch, tp=1):
     seq / batch: 上下文长度 / 并发请求数
     tp: 张量并行卡数。权重/KV/计算按 tp 均分到每卡，可行性按**每卡**判；
         切分不改变算术强度（AI 不变），只改变每步时间。默认 1。
+    pp: 流水线并行段数。模型按层切到 pp 段，每段的权重/KV/计算只占 1/pp。
+        **买的是容量，不是速度**：每个微批都要把本段的权重重读一遍。
+    micro_batch: 微批个数 M（pp>1 时生效，缺省 = batch）。M 越大气泡越小，
+        但权重被重读 M 次——memory-bound 的 decode 里这两者方向相反。
+    kv_block: KV 分配的块大小（token），模拟 PagedAttention 的整块分配。
+        缺省 None = 精确分配（不做块对齐）。设了就按 ceil(seq/块)×块 算容量。
     """
     if tp < 1:
         raise ValueError("tp 必须 >= 1")
+    if pp < 1:
+        raise ValueError("pp 必须 >= 1")
+    if kv_block is not None and kv_block < 1:
+        raise ValueError("kv_block 必须 >= 1")
+    # 微批只在 pp>1 时有意义；pp=1 时整批一次算完，M 恒为 1。
+    mb = 1 if pp == 1 else (batch if micro_batch is None else micro_batch)
+    if mb < 1 or mb > batch:
+        raise ValueError(f"micro_batch 必须在 [1, batch={batch}] 之间（收到 {mb}）")
 
     n = params_of(model)                 # 全部参数（MoE 含所有专家）
     active = active_params_of(model)     # 每 token 实际激活的参数
     moe = model.get("moe")
     weights_bytes = n * weight_b         # 集群总权重字节（必须全部常驻显存）
-    per_gpu_weights = weights_bytes / tp
-    kv_per_req = seq * kv_bytes_per_token(model, kv_b)
-    kv_needed = batch * kv_per_req       # 集群总 KV
-    kv_gpu = kv_needed / tp              # KV 按 TP 头数均分（需 kv 头数被 tp 整除）
+
+    # 分块分配：PagedAttention 按整块给 KV，每个请求最多浪费一块。
+    kv_tok = kv_bytes_per_token(model, kv_b)
+    if kv_block:
+        alloc_tokens = -(-seq // kv_block) * kv_block   # ceil(seq/kv_block)*kv_block
+    else:
+        alloc_tokens = seq
+    kv_pad_tokens = alloc_tokens - seq
+    kv_per_req = alloc_tokens * kv_tok           # 每请求 KV（含内部碎片）
+
+    # 卡数 = tp × pp：权重/KV/计算都按这个总数均分
+    gpus = tp * pp
+    per_gpu_weights = weights_bytes / gpus
+    kv_needed = batch * kv_per_req               # 集群总 KV
+    kv_gpu = kv_needed / gpus                    # 每卡 KV
+    kv_per_req_gpu = kv_per_req / gpus           # 每卡每请求 KV（算容量上限用）
 
     vram_bytes = hw["vram"] * GIB
     weights_fit = per_gpu_weights <= vram_bytes
     free = vram_bytes - per_gpu_weights
     batch_fits = weights_fit and kv_gpu <= free
     runnable = weights_fit and batch_fits
+    max_concurrency = int(free // kv_per_req_gpu) if (weights_fit and kv_per_req_gpu > 0) else 0
 
     # 计算量（batch 个请求、每步各出 1 个 token）。MoE 用激活参数，不是全量参数。
     attn_flops_per_token = 4 * model["layers"] * model["q"] * model["hd"] * seq
     flops = batch * (2 * active + attn_flops_per_token)   # 集群总 FLOPs
-    flops_gpu = flops / tp
+    flops_gpu = flops / gpus
 
     # 关键：权重每步只从显存读**一次**（batch 共享同一份权重），只有 KV 随 batch 线性增长。
     # 这正是 batching 能摊薄权重、把 AI 提上去的物理来源；写错成 batch*weights 会让 AI 永远不变。
@@ -256,12 +284,12 @@ def analyze(model, hw, weight_b, kv_b, seq, batch, tp=1):
         expert_b = 3 * model["hidden"] * moe["inter"] * weight_b
         shared_b = (n - expert_params_of(model)) * weight_b
         expert_reads = min(batch * moe["top_k"], moe["experts"])
-        weight_read_gpu = (shared_b + expert_reads * expert_b) / tp
+        weight_read = shared_b + expert_reads * expert_b
     else:
         expert_reads = None
-        weight_read_gpu = weights_bytes / tp
-    read_gpu = weight_read_gpu + kv_gpu          # 每卡每步读取
-    read_bytes = read_gpu * tp                   # 集群口径（AI 与每卡口径一致）
+        weight_read = weights_bytes
+    read_gpu = (weight_read + kv_needed) / gpus   # 每卡每步读取（理想：权重只读一次）
+    read_bytes = read_gpu * tp
     ai = flops_gpu / read_gpu
 
     ridge = hw["flops"] / hw["bandwidth"]
@@ -270,12 +298,28 @@ def analyze(model, hw, weight_b, kv_b, seq, batch, tp=1):
     # memory 时按带宽比例换算。这不是实测利用率，绝不能读成"GPU 打满了 X%"。
     util_pct = 100.0 * min(1.0, ai / ridge)
 
-    # 纸面单步下限（理想情况；真实只会更慢，因为调度/通信/kernel 效率都没算）
+    # 一段处理一个微批的时间（理想情况；真实只会更慢）
     if bound == "memory":
-        step_s = read_gpu / hw["bandwidth"]
+        # 每个微批都要把本段的权重**再读一遍**——这就是 PP 在 decode 上的真实代价
+        stage_s = (weight_read / gpus + kv_needed / (gpus * mb)) / hw["bandwidth"]
     else:
-        step_s = flops_gpu / hw["flops"]
-    tok_per_s = batch / step_s
+        stage_s = flops_gpu / hw["flops"]
+    # 排空 M 个微批需要 (M + P - 1) 个段时步
+    drain_s = (mb + pp - 1) * stage_s
+    tok_per_s = batch / drain_s
+
+    # PP 相对"同样的卡只做 TP 不做 PP"的有效吞吐倍数。
+    # 教科书公式 P·M/(M+P−1) 是 compute-bound 口径（计算不会被重读）；
+    # 我们多数时候是 memory-bound，权重会被重读 M 次，所以要用字节口径：
+    #   P·M·(w+k) / ((M+P−1)·(M·w+k))     ← M 大时会 < 1，即比单卡还慢
+    if pp == 1:
+        pp_speedup = 1.0
+    elif bound == "compute":
+        pp_speedup = pp * mb / (mb + pp - 1)
+    else:
+        w, k = weight_read, kv_needed
+        pp_speedup = (pp * mb * (w + k)) / ((mb + pp - 1) * (mb * w + k))
+    bubble_frac = 0.0 if pp == 1 else (pp - 1) / (mb + pp - 1)
 
     # TP 通信：每层 2 次 ring AllReduce，每次移动 2(tp-1)/tp × h×batch 个 fp16 激活。
     # 只是理想 ring 口径的**下界**，没有计入单步下限（需要实测互连 busbw）。
@@ -284,12 +328,17 @@ def analyze(model, hw, weight_b, kv_b, seq, batch, tp=1):
     # prefill 的算术强度：计算随 seq 线性（矩阵乘）+ 二次（注意力），读取≈权重
     prefill_flops = (2 * active * seq
                      + 4 * model["layers"] * model["q"] * model["hd"] * seq * seq)
-    prefill_ai = prefill_flops / (weight_read_gpu * tp)
+    prefill_ai = prefill_flops / (weight_read * pp)
 
     result = {
         "model": model, "hw": hw,
         "params": n, "active_params": active,
-        "tp": tp,
+        "tp": tp, "pp": pp, "gpus": gpus,
+        "micro_batch": mb,
+        "kv_block": kv_block,
+        "kv_alloc_tokens": alloc_tokens,
+        "kv_pad_tokens": kv_pad_tokens,
+        "kv_pad_pct": 100.0 * kv_pad_tokens / seq if seq else 0.0,
         "weight_b": weight_b, "kv_b": kv_b,
         "weight_name": precision_name(weight_b), "kv_name": precision_name(kv_b),
         "seq": seq, "batch": batch,
@@ -299,6 +348,7 @@ def analyze(model, hw, weight_b, kv_b, seq, batch, tp=1):
         "kv_needed": kv_needed,
         "vram_bytes": vram_bytes,
         "free_bytes": free,
+        "max_concurrency": max_concurrency,
         "weights_fit": weights_fit,
         "batch_fits": batch_fits,
         "runnable": runnable,
@@ -312,9 +362,12 @@ def analyze(model, hw, weight_b, kv_b, seq, batch, tp=1):
         "util_pct": util_pct,
         "prefill_ai": prefill_ai,
         "prefill_bound": "compute" if prefill_ai >= ridge else "memory",
-        "step_s": step_s if runnable else None,
+        "bubble_frac": bubble_frac,
+        "pp_speedup": pp_speedup,
+        "stage_s": stage_s if runnable else None,
+        "step_s": drain_s if runnable else None,
         "tok_per_s": tok_per_s if runnable else None,
-        "ms_per_token": (step_s / batch * 1000.0) if runnable else None,
+        "ms_per_token": (drain_s / batch * 1000.0) if runnable else None,
     }
     return result
 
@@ -344,6 +397,10 @@ def format_report(r):
            f"prompt {r['seq']} | batch {r['batch']}")
     if r["tp"] > 1:
         cfg += f" | tp={r['tp']}（张量并行）"
+    if r["pp"] > 1:
+        cfg += f" | pp={r['pp']}（流水线并行，{r['micro_batch']} 个微批）"
+    if r.get("kv_block"):
+        cfg += f" | KV 块 {r['kv_block']} token（分页分配）"
     lines.append(cfg)
     if m.get("moe"):
         moe = m["moe"]
@@ -358,6 +415,23 @@ def format_report(r):
         lines.append(f"TP: 权重/KV/计算按 tp={r['tp']} 均分，以下可行性为**每卡**口径{warn}；"
                      f"每步每卡 AllReduce ≈ {r['comm_bytes_per_step'] / 1e6:.2f} MB"
                      f"（理想 ring 下界，未计入单步下限——需实测互连 busbw）")
+    if r["pp"] > 1:
+        warn = ""
+        if m["layers"] % r["pp"] != 0:
+            warn = (f"；注意层数 {m['layers']} 不能被 pp={r['pp']} 整除，"
+                    "实际框架要求层数能被段数整除，这里的均分是近似")
+        lines.append(f"PP: 模型按 pp={r['pp']} 切成 {r['pp']} 段"
+                     f"（每段约 {m['layers'] / r['pp']:.1f} 层），"
+                     f"{r['micro_batch']} 个微批 → 气泡占比 {r['bubble_frac'] * 100:.1f}%；"
+                     f"相对同卡只做 TP 的有效吞吐 {r['pp_speedup']:.2f}×{warn}")
+        if r["pp_speedup"] < 1.0:
+            lines.append(f"⚠️  微批开到 {r['micro_batch']} 个，每个微批都要把本段权重**再读一遍** → "
+                         f"这套 PP 配置比单卡还慢（{r['pp_speedup']:.2f}×）。"
+                         "PP 在这里买的是容量，不是速度：把微批调大不等于更快。")
+    if r.get("kv_block"):
+        lines.append(f"分页: KV 按 {r['kv_block']} token 整块分配 → 每请求占 "
+                     f"{r['kv_alloc_tokens']} token（内部碎片 {r['kv_pad_tokens']} token，"
+                     f"{r['kv_pad_pct']:.1f}%）")
     lines.append("")
 
     # --- 可行性 ---
@@ -367,6 +441,13 @@ def format_report(r):
     kf = "✓" if r["batch_fits"] else ("✗ 超容量" if r["weights_fit"] else "— 权重先装不下")
     lines.append(f"KV : 每请求 {_gib(r['kv_per_req']):.2f} GiB × {r['batch']} "
                  f"= {_gib(r['kv_needed']):.2f} GiB 集群 / 每卡余量 {_gib(r['free_bytes']):.2f} GiB  {kf}")
+    cap = r["max_concurrency"]
+    extra = ""
+    if cap < r["batch"]:
+        extra = " ← 当前 batch 已超容量"
+    elif cap == 0:
+        extra = " ← 一个请求都放不下"
+    lines.append(f"容量: 余量最多容纳 {cap} 个并发请求（当前 batch {r['batch']}）{extra}")
 
     if not r["runnable"]:
         # 关键：装不下就拒绝给时间/吞吐。物理上不存在这个数，给了就是误导。
@@ -375,12 +456,14 @@ def format_report(r):
                          f"每卡超 {_gib(r['per_gpu_weights_bytes'] - r['vram_bytes']):.2f} GiB。"
                          "这个配置根本部署不了，任何时间/吞吐数字都会是假的，所以这里不印。")
             lines.append("出路: 换更大显存的卡 / 降低权重量化（--precision int4）/ "
-                         "张量并行（--tp N，权重按卡数均分）。")
+                         "张量并行（--tp N，权重按卡数均分）/ "
+                         "流水线并行（--pp N，按层切段，只买容量不买速度）。")
         else:
             lines.append(f"判定: 跑不起来——权重装得下，但 batch={r['batch']} 的 KV "
-                         f"每卡需要 {_gib(r['kv_needed'] / r['tp']):.2f} GiB，超出余量 "
+                         f"每卡需要 {_gib(r['kv_needed'] / r['gpus']):.2f} GiB，超出余量 "
                          f"{_gib(r['free_bytes']):.2f} GiB。不印假的吞吐。")
-            lines.append("出路: 缩短 prompt（--seq）/" + "降 KV 精度（--kv-precision int4）/ 减 batch / 换更大的卡。")
+            lines.append("出路: 缩短 prompt（--seq）/ 降 KV 精度（--kv-precision int4）/ "
+                         "减 batch / 换更大的卡 / 加 --tp 或 --pp 分摊 KV。")
         lines.append("")
         lines.append(f"→ 纸面判定: {'MEMORY' if r['bound'] == 'memory' else 'COMPUTE'}-BOUND"
                      "（前提是装得下，而它装不下）")
@@ -398,8 +481,13 @@ def format_report(r):
         lines.append("→ COMPUTE-BOUND（受算力限制）")
     lines.append(f"roofline 理论算力上界 / 峰值 ≈ {r['util_pct']:.2f}%"
                  "（这是理论上界占峰值的比例，不是实测 GPU 利用率）")
-    lines.append(f"纸面单步下限 ≈ {r['step_s'] * 1000:.1f} ms"
-                 f"（每 token {r['ms_per_token']:.2f} ms，聚合 ≈ {r['tok_per_s']:.0f} tok/s）")
+    if r["pp"] > 1:
+        lines.append(f"纸面流水线排空 ≈ {r['step_s'] * 1000:.1f} ms"
+                     f"（每段 {r['stage_s'] * 1000:.2f} ms × {r['micro_batch'] + r['pp'] - 1} 步；"
+                     f"每 token {r['ms_per_token']:.2f} ms，聚合 ≈ {r['tok_per_s']:.0f} tok/s）")
+    else:
+        lines.append(f"纸面单步下限 ≈ {r['step_s'] * 1000:.1f} ms"
+                     f"（每 token {r['ms_per_token']:.2f} ms，聚合 ≈ {r['tok_per_s']:.0f} tok/s）")
     lines.append(f"prefill 算术强度 ≈ {r['prefill_ai']:.0f}（"
                  f"{'COMPUTE' if r['prefill_bound'] == 'compute' else 'MEMORY'}-BOUND，权重主导近似）")
     lines.append("")
@@ -416,6 +504,10 @@ def format_report(r):
     else:
         tip = ("decode 已进入 compute-bound，算力是瓶颈；再多 batching 意义有限，"
                "重点是更快的算力或更高效的 kernel。")
+    if r["pp"] > 1 and r["pp_speedup"] < 1.0:
+        tip = (f"PP 在这里是容量工具、不是加速工具：{r['micro_batch']} 个微批让本段权重被重读 "
+               f"{r['micro_batch']} 次，有效吞吐只有单卡的 {r['pp_speedup']:.2f}×。"
+               "要速度用 TP，要容量才用 PP——或者把微批数压到最小。")
     lines.append(f"[一句话] {tip}")
     return "\n".join(lines)
 
@@ -431,7 +523,8 @@ def selftest(prove_red=False):
     model = dict(MODEL_PRESETS["qwen3-4b"], name="qwen3-4b")
 
     if prove_red:
-        # 注入一个真实存在的天真错误：把"每步只读一次权重"写成"batch 个请求各读一遍权重"。
+        fails = 0
+        # 反证 1：把"每步只读一次权重"写成"batch 个请求各读一遍权重"。
         # 这个错误会让 AI 与 batch 无关（永远 1.21），从而让"B=32 AI≈12.2"这条断言变红。
         # 用裸算式重算，证明判据能把"对"和"错"分开——而不是无论对错都绿。
         n = params_of(model)
@@ -441,7 +534,6 @@ def selftest(prove_red=False):
         flops32 = 32 * (2 * n + attn)
         good = flops32 / (weights + 32 * kv_req)          # 正确：权重读一次 → ~12.2
         bad = flops32 / (32 * weights + 32 * kv_req)      # 天真错误：权重读 32 次 → ~1.21
-        fails = 0
         print(f"[INFO] 正确口径 B=32 AI={good:.2f}；注入 batching 错误后 AI={bad:.2f}")
         if abs(bad - 12.23) <= 0.3:
             print("[FAIL] 注入错误后断言仍通过 → 断言无效（测不出错误）")
@@ -449,6 +541,23 @@ def selftest(prove_red=False):
         else:
             print(f"[FAIL] B=32 AI={bad:.2f}（正确应 ~12.2）→ 断言确实变红")
             fails += 1
+
+        # 反证 2：PP 用教科书（compute-bound）公式 P·M/(M+P−1) 代替字节口径。
+        # decode 是 memory-bound，权重会被重读 M 次；教科书公式看不见这件事，
+        # 于是把"比单卡慢 5 倍"算成"比单卡快 2 倍"——断言必须抓到这个差。
+        w = n * 2.0
+        k = 32 * 4096 * kv_bytes_per_token(model, 2.0)
+        good_pp = (2 * 32 * (w + k)) / ((32 + 2 - 1) * (32 * w + k))
+        bad_pp = 2 * 32 / (32 + 2 - 1)
+        print(f"[INFO] 正确 PP 口径 pp=2 M=32 → {good_pp:.2f}×；"
+              f"教科书公式给 {bad_pp:.2f}×（差 {bad_pp / good_pp:.1f} 倍）")
+        if abs(bad_pp - 0.1918) < 1e-3:
+            print("[FAIL] 注入教科书公式后断言仍通过 → 断言无效（测不出错误）")
+            fails += 1
+        else:
+            print(f"[FAIL] pp=2 M=32 有效吞吐 {bad_pp:.2f}×（正确应 ~0.19）→ 断言确实变红")
+            fails += 1
+
         print(f"prove-red: {fails} 条断言如预期变红 → 断言有效（门会红）")
         return fails > 0
 
@@ -495,6 +604,26 @@ def selftest(prove_red=False):
     check("tp=2 切分不改变 AI，且每步通信 = 2,949,120 B（理想 ring，B=8）",
           abs(rtp2["ai"] - rtp1["ai"]) < 1e-9 and rtp2["comm_bytes_per_step"] == 2_949_120,
           f"AI {rtp2['ai']:.4f} / comm {rtp2['comm_bytes_per_step']:,}")
+
+    # --- 分页 KV 与流水线并行 ---
+    rpg = analyze(model, hw, 2.0, 2.0, 100, 1, kv_block=16)
+    check("分页 B=16：100 token 要占 112 token（内部碎片 12 = 12.0%）",
+          rpg["kv_alloc_tokens"] == 112 and rpg["kv_pad_tokens"] == 12
+          and abs(rpg["kv_pad_pct"] - 12.0) < 1e-9,
+          f"{rpg['kv_alloc_tokens']} token / +{rpg['kv_pad_tokens']} / "
+          f"{rpg['kv_pad_pct']:.1f}%")
+    rpg4k = analyze(model, hw, 2.0, 2.0, 4096, 1, kv_block=16)
+    check("分页 B=16：4096 token 零碎片（块粒度对长上下文免费）",
+          rpg4k["kv_pad_tokens"] == 0, f"+{rpg4k['kv_pad_tokens']}")
+    rpp = analyze(model, hw, 2.0, 2.0, 4096, 32, pp=2, micro_batch=2)
+    check("pp=2 M=2（B=32）有效吞吐 1.03×、气泡 33.3%（几乎白给）",
+          abs(rpp["pp_speedup"] - 1.0305) < 1e-3
+          and abs(rpp["bubble_frac"] - 1 / 3) < 1e-9,
+          f"{rpp['pp_speedup']:.4f}× / 气泡 {rpp['bubble_frac'] * 100:.1f}%")
+    rpp32 = analyze(model, hw, 2.0, 2.0, 4096, 32, pp=2, micro_batch=32)
+    check("pp=2 M=32 有效吞吐 0.19×（权重被重读 32 次，比单卡还慢 5 倍）",
+          rpp32["pp_speedup"] < 1.0 and abs(rpp32["pp_speedup"] - 0.1918) < 1e-3,
+          f"{rpp32['pp_speedup']:.4f}×")
 
     ok = all(c for _, c, _ in checks)
     print(f"\nselftest: {sum(1 for _, c, _ in checks if c)}/{len(checks)} 通过")
@@ -568,6 +697,13 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=1, help="并发请求数（默认 1）")
     ap.add_argument("--tp", type=int, default=1,
                     help="张量并行卡数（默认 1；权重/KV/计算按卡数均分）")
+    ap.add_argument("--pp", type=int, default=1,
+                    help="流水线并行段数（默认 1；按层切段，只分摊容量、不加速）")
+    ap.add_argument("--micro-batch", type=int, default=None,
+                    help="微批个数 M（仅 --pp>1 有效，缺省 = batch；"
+                         "M 越大气泡越小但权重被重读 M 次）")
+    ap.add_argument("--kv-block", type=int, default=None,
+                    help="KV 分页块大小（token），模拟 PagedAttention 的整块分配；缺省不启用")
     ap.add_argument("--json", action="store_true", help="输出 JSON 而不是文本报告")
     ap.add_argument("--list", action="store_true", help="列出模型与硬件预设")
     ap.add_argument("--selftest", action="store_true", help="跑自检断言")
@@ -582,10 +718,20 @@ def main(argv=None):
     if args.prove_red:
         return 0 if selftest(prove_red=True) else 1
 
-    # 输入合法性：seq/batch/tp 必须是正整数，否则公式无意义
-    for name in ("seq", "batch", "tp"):
+    # 输入合法性：seq/batch/tp/pp/kv-block 必须是正整数，否则公式无意义
+    for name in ("seq", "batch", "tp", "pp"):
         if getattr(args, name) <= 0:
             ap.error(f"--{name} 必须为正整数（收到 {getattr(args, name)}）")
+    if args.kv_block is not None and args.kv_block <= 0:
+        ap.error(f"--kv-block 必须为正整数（收到 {args.kv_block}）")
+    if args.micro_batch is not None:
+        if args.micro_batch <= 0:
+            ap.error(f"--micro-batch 必须为正整数（收到 {args.micro_batch}）")
+        if args.pp <= 1:
+            ap.error("--micro-batch 只在 --pp > 1 时有意义（pp=1 时整批一次算完）")
+        if args.micro_batch > args.batch:
+            ap.error(f"--micro-batch({args.micro_batch}) 不能大于 --batch({args.batch})："
+                     "微批是并发请求的切分，切不出比总数更多的份")
 
     if args.config:
         model = _load_hf_config(args.config)
@@ -602,7 +748,8 @@ def main(argv=None):
     weight_b = PRECISION_BYTES[args.precision]
     kv_b = PRECISION_BYTES[args.kv_precision] if args.kv_precision else weight_b
 
-    r = analyze(model, hw, weight_b, kv_b, args.seq, args.batch, tp=args.tp)
+    r = analyze(model, hw, weight_b, kv_b, args.seq, args.batch, tp=args.tp,
+                pp=args.pp, micro_batch=args.micro_batch, kv_block=args.kv_block)
     if args.json:
         print(json.dumps(r, ensure_ascii=False, indent=2, default=lambda o: o))
     else:
