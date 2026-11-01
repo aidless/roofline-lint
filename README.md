@@ -98,6 +98,20 @@ python3 roofline_lint.py            # defaults: qwen3-4b @ a100-40g, fp16, seq=4
 
 No install, no dependencies — a single standard-library Python file.
 
+## Repository layout
+
+```
+roofline-lint/
+├── roofline_lint.py        # the tool (zero deps, stdlib only; MODELS/HW presets + CLI)
+├── test_roofline_lint.py   # 43 unit tests (byte-exact preset verification + --prove-red hooks)
+├── README.md               # this file: math, CLI, data provenance, limitations, comparison
+├── LICENSE                 # MIT
+└── .github/workflows/      # CI
+```
+
+The whole repository is three files plus CI: one implementation, one test, one README. There is
+no package to install — `python3 roofline_lint.py` is the entry point.
+
 ### It fits, and decode is memory-bound
 
 ```text
