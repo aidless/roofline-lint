@@ -191,7 +191,7 @@ PP: 模型按 pp=2 切成 2 段（每段约 40.0 层），8 个微批 → 气泡
 纸面流水线排空 ≈ 314.4 ms（每段 34.93 ms × 9 步；每 token 39.30 ms，聚合 ≈ 25 tok/s）
 ```
 
-**215 tok/s vs 25 tok/s on the same hardware — PP is 8.6× slower here.** The reason is not the
+**215 tok/s vs 25 tok/s on the same hardware — TP is 8.4× faster here.** The reason is not the
 bubble (only 11.1%). It is that decode is memory-bound, and every micro-batch re-reads the whole
 stage's weights from HBM. Eight micro-batches means eight weight reads per step. Tensor parallel
 does the opposite: it divides both the weights *and* the KV bytes, so its memory traffic per GPU
