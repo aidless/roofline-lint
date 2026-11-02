@@ -335,6 +335,22 @@ shows the assertions are wired to a real mechanism, not a tautology.
 
 ---
 
+## 验证（Verification / 复现）
+
+本工具的**自测可复现**且**可被证明会失败**：
+
+```bash
+python3 roofline_lint.py --selftest        # 17 个手算工作点（byte-exact 断言）
+python3 roofline_lint.py --prove-red       # 注入两个已知错误公式，断言套件必须转红
+python3 -m unittest test_roofline_lint -v  # 43 个单测（含预设 byte-exact 校验）
+```
+
+- `--selftest` 的 17 个工作点全部手算可复算，不依赖 GPU/大模型。
+- `--prove-red` 是**反证**而非装饰：注入 batching bug 时算术强度停在 1.21（正确 12.2）、注入 textbook-PP bug 时声称 1.94×（正确 0.19×，10.1× 差距且符号相反）——两者均被断言捕获。这证明测试断言**接在真实机制上**，不是同义反复（tautology）。
+- 若未来任一公式被改错，`--selftest` 会失败——反证链把「门能失败」与「公式正确」绑定。
+
+---
+
 ## Limitations (read these before quoting a number)
 
 - **Analytical lower bound, not a benchmark.** Peak specs × op counts. Real kernels reach a
