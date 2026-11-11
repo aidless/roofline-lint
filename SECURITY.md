@@ -9,3 +9,4 @@ This is a personal research project; only the latest commit on the default branc
 If you discover a security issue, please **open a private GitHub security advisory** via this repository's **Security → Report a vulnerability** button (https://github.com/aidless/roofline-lint/security/advisories/new), or contact the maintainer through their GitHub profile. Please do not open a public issue for exploit details.
 
 You can expect an initial response within 7 days.
+Release 资产用此密钥（SIGNING_KEY.asc）签名，验证命令 `gpg --verify <asset>.asc <asset>`。
