@@ -91,9 +91,14 @@ so its arithmetic intensity is orders of magnitude higher. The prefill number he
 ## Quick start
 
 ```bash
+# 现已上架 PyPI（无需克隆）：
+pip install roofline-lint
+roofline-lint                       # defaults: qwen3-4b @ a100-40g, fp16, seq=4096, batch=1
+
+# 或单文件直跑（零依赖，标准库实现）：
 git clone https://github.com/aidless/roofline-lint.git
 cd roofline-lint
-python3 roofline_lint.py            # defaults: qwen3-4b @ a100-40g, fp16, seq=4096, batch=1
+python3 roofline_lint.py            # 同上
 ```
 
 No install, no dependencies — a single standard-library Python file.
