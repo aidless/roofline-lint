@@ -1,0 +1,129 @@
+{
+ "total": 20,
+ "passed": 20,
+ "failed": 0,
+ "selftest": false,
+ "failed_by_axis": {},
+ "results": [
+  {
+   "id": "PA-01",
+   "axis": "params/参数量",
+   "ok": true,
+   "detail": "4022468096"
+  },
+  {
+   "id": "PA-02",
+   "axis": "params/参数量",
+   "ok": true,
+   "detail": "46702792704"
+  },
+  {
+   "id": "PA-03",
+   "axis": "params/参数量",
+   "ok": true,
+   "detail": "30532122624"
+  },
+  {
+   "id": "MO-01",
+   "axis": "moe/激活参数",
+   "ok": true,
+   "detail": "12879925248"
+  },
+  {
+   "id": "MO-02",
+   "axis": "moe/激活参数",
+   "ok": true,
+   "detail": "28991029248"
+  },
+  {
+   "id": "KV-01",
+   "axis": "kv/每token字节",
+   "ok": true,
+   "detail": "147456.0"
+  },
+  {
+   "id": "KV-02",
+   "axis": "kv/每token字节",
+   "ok": true,
+   "detail": "49152.0"
+  },
+  {
+   "id": "RO-01",
+   "axis": "roofline/算术强度",
+   "ok": true,
+   "detail": "1.209499009437017"
+  },
+  {
+   "id": "RO-02",
+   "axis": "roofline/算术强度",
+   "ok": true,
+   "detail": "12.229425503234085"
+  },
+  {
+   "id": "CA-01",
+   "axis": "capacity/可行性",
+   "ok": true,
+   "detail": "False,False,None"
+  },
+  {
+   "id": "CA-02",
+   "axis": "capacity/可行性",
+   "ok": true,
+   "detail": "57"
+  },
+  {
+   "id": "CA-03",
+   "axis": "capacity/可行性",
+   "ok": true,
+   "detail": "True,False,None"
+  },
+  {
+   "id": "TP-01",
+   "axis": "parallel/TP与PP",
+   "ok": true,
+   "detail": "True,2949120"
+  },
+  {
+   "id": "PP-01",
+   "axis": "parallel/TP与PP",
+   "ok": true,
+   "detail": "1.030469923681255"
+  },
+  {
+   "id": "PP-02",
+   "axis": "parallel/TP与PP",
+   "ok": true,
+   "detail": "0.19180746045550567"
+  },
+  {
+   "id": "PG-01",
+   "axis": "paging/分页KV",
+   "ok": true,
+   "detail": "112,12,12.0"
+  },
+  {
+   "id": "PG-02",
+   "axis": "paging/分页KV",
+   "ok": true,
+   "detail": "0"
+  },
+  {
+   "id": "ER-01",
+   "axis": "errors/参数校验",
+   "ok": true,
+   "detail": "raised ValueError"
+  },
+  {
+   "id": "ER-02",
+   "axis": "errors/参数校验",
+   "ok": true,
+   "detail": "raised ValueError"
+  },
+  {
+   "id": "DOC-01",
+   "axis": "doc/口径声明",
+   "ok": true,
+   "detail": "装不下的配置，一律不印时间/吞吐"
+  }
+ ]
+}

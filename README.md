@@ -420,3 +420,33 @@ fast "will this even launch, and where will it hurt, and can I trust the answer"
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## 验收题库与复算
+
+`eval/cases.jsonl` 是 20 条可执行验收题（19 条 `expr`/`raises` + 1 条 `doc`），覆盖八个口径：
+参数量（稠密与 MoE 全量）、MoE 激活参数与「专家必须常驻」、每 token KV 字节、
+roofline 算术强度与瓶颈判定、容量可行性（含**装不下就不印 tok/s**）、
+TP 切分与 ring AllReduce 字节、PP 微批口径（`pp_speedup` 大于或小于 1）、
+分页 KV 的块内碎片、以及参数校验与核心口径声明。同一 `axis` 最多 3 条。
+
+大部分题目的期望值不是抄文档，而是**调用本模块的 API 现算**（`params_of` /
+`active_params_of` / `expert_params_of` / `kv_bytes_per_token` / `analyze`），
+数值是 2026-11-13 在这棵树上真跑出来的；改一行公式就可能让它变红，这正是这套题的意义。
+
+```bash
+python3 eval/run_cases.py            # 20/20 cases passed（退出码 0）
+python3 eval/run_cases.py --save     # 顺带把结果写进 eval/run-report.json
+python3 eval/run_cases.py --selftest # 篡改第一条期望值，必须变红（19/20）——证明这套题会失败
+```
+
+**数字如何复算**：`eval/run-report.json` 里每条 case 都带 `id` / `axis` / `detail`，
+`detail` 是这次实跑拿到的值；把它和 `cases.jsonl` 里同一 `id` 的 `verify` 代码放在一起看，
+就能从源码复现该数字。`--save` 重跑一次即可重建整份报告，不需要手工抄数。
+
+**失败归因**：`run_cases.py` 不只报通过率，失败时按 `axis` 汇总（例如
+`parallel/TP与PP: 1 条 —— PP-02`），直接指出是哪个模块的哪个口径坏了。
+`mode` 三档的口径：`expr` 执行 `verify` 后读变量 `result` 与 `expected` 比较
+（数值容差 1e-9，字符串去空格比较）；`raises` 断言异常类名；`doc` 断言
+`相对路径::正则` 在该文件里命中。
